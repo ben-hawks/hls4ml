@@ -424,6 +424,123 @@ class StandardFloatPrecisionType(PrecisionType):
         return state
 
 
+class PositPrecisionType(PrecisionType):
+    """
+    Class representing a posit<width, es> type, used for weight storage only.
+
+    Values are stored as raw ``width``-bit posit codes and decoded in hardware to the fixed-point type returned by
+    ``decode_precision()``, which represents every posit value exactly. Arithmetic is done in fixed point.
+
+    Args:
+        width (int, optional): Total number of bits used. Defaults to 8.
+        es (int, optional): Number of exponent bits. Defaults to 0.
+    """
+
+    def __init__(self, width=8, es=0):
+        if width < 2:
+            raise ValueError(f'Posit width must be at least 2, got {width}')
+        if es < 0:
+            raise ValueError(f'Posit es must be non-negative, got {es}')
+        super().__init__(width=width, signed=True)
+        self.es = es
+
+    def __str__(self):
+        return f'posit<{self.width},{self.es}>'
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, PositPrecisionType):
+            return super().__eq__(other) and self.es == other.es
+        return False
+
+    def __hash__(self) -> int:
+        return super().__hash__() ^ hash(self.es)
+
+    @property
+    def max_scale(self):
+        """log2 of the largest posit value (maxpos); the smallest positive value (minpos) is 2**-max_scale."""
+        return (self.width - 2) << self.es
+
+    def decode_precision(self):
+        """The narrowest fixed-point type that represents every value of this posit exactly."""
+        return FixedPrecisionType(width=2 * self.max_scale + 2, integer=self.max_scale + 2, signed=True)
+
+    def decode(self, codes):
+        """Decode an array of raw posit codes to their values (float64). NaR is returned as NaN."""
+        n, es = self.width, self.es
+        codes = np.asarray(codes, dtype=np.int64) & ((1 << n) - 1)
+        out = np.empty(codes.shape, dtype=np.float64)
+        for idx, c in np.ndenumerate(codes):
+            out[idx] = self._decode_one(int(c), n, es)
+        return out
+
+    @staticmethod
+    def _decode_one(c, n, es):
+        if c == 0:
+            return 0.0
+        if c == 1 << (n - 1):
+            return np.nan
+        sign = c >> (n - 1)
+        if sign:
+            c = (-c) & ((1 << n) - 1)
+        r0 = (c >> (n - 2)) & 1
+        m = 0
+        for i in range(n - 2, -1, -1):
+            if (c >> i) & 1 != r0:
+                break
+            m += 1
+        k = m - 1 if r0 else -m
+        rem = max(n - 2 - m, 0)
+        tail = c & ((1 << rem) - 1)
+        if rem >= es:
+            e = tail >> (rem - es)
+            nf = rem - es
+        else:
+            e = tail << (es - rem)
+            nf = 0
+        f = tail & ((1 << nf) - 1)
+        value = ((1 << nf) + f) * 2.0 ** ((k << es) + e - nf)
+        return -value if sign else value
+
+    def _table(self):
+        # Positive codes are 1 .. 2**(width-1)-1 and are already in increasing order of value
+        if getattr(self, '_table_cache', None) is None:
+            codes = np.arange(1, 1 << (self.width - 1), dtype=np.int64)
+            self._table_cache = (codes, self.decode(codes))
+        return self._table_cache
+
+    def encode(self, x):
+        """
+        Round values to the nearest posit and return the raw codes (int64, in [0, 2**width)).
+
+        Rounding is to the nearest value, ties to the even code. Non-zero values never round to zero and saturate at
+        +/- maxpos, as in the posit standard. NaN/inf are not supported.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        if not np.all(np.isfinite(x)):
+            raise ValueError('Cannot encode non-finite values as posits')
+        codes, values = self._table()
+        a = np.clip(np.abs(x), values[0], values[-1])
+        if len(values) == 1:
+            out = np.broadcast_to(codes[0], a.shape)
+        else:
+            hi = np.clip(np.searchsorted(values, a), 1, len(values) - 1)
+            lo = hi - 1
+            d_lo = a - values[lo]
+            d_hi = values[hi] - a
+            pick_hi = (d_hi < d_lo) | ((d_hi == d_lo) & (codes[hi] % 2 == 0))
+            out = np.where(pick_hi, codes[hi], codes[lo])
+        # Negative posits are the two's complement of the positive code
+        out = np.where(x < 0, (1 << self.width) - out, out)
+        return np.where(x == 0, 0, out).astype(np.int64)
+
+    def quantize(self, x):
+        """Round values to the nearest posit value (float64)."""
+        return self.decode(self.encode(x))
+
+    def serialize_state(self):
+        return {'width': self.width, 'es': self.es}
+
+
 class UnspecifiedPrecisionType(PrecisionType):
     """
     Class representing an unspecified precision type.
@@ -712,6 +829,8 @@ class WeightVariable(Variable):
         if not self._iterator.finished:
             value = self._iterator[0]
             self._iterator.iternext()
+            if isinstance(self.type.precision, PositPrecisionType):
+                value = int(self.type.precision.encode(value))
             return self.precision_fmt.format(value)
         else:
             raise StopIteration
@@ -724,6 +843,8 @@ class WeightVariable(Variable):
             self.precision_fmt = ''  # Temporarily set precision to undefined value
         elif isinstance(new_precision, (IntegerPrecisionType, XnorPrecisionType, ExponentPrecisionType)):
             self.precision_fmt = '{:.0f}'
+        elif isinstance(new_precision, PositPrecisionType):
+            self.precision_fmt = '{:d}'  # Raw posit codes
         elif isinstance(new_precision, FixedPrecisionType):
             decimal_spaces = max(0, new_precision.fractional)
             self.precision_fmt = f'{{:.{decimal_spaces}f}}'

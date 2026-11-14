@@ -9,6 +9,7 @@ from hls4ml.model.types import (
     IntegerPrecisionType,
     NamedType,
     PackedType,
+    PositPrecisionType,
     StandardFloatPrecisionType,
     XnorPrecisionType,
 )
@@ -70,6 +71,11 @@ class APStandardFloatPrecisionDefinition(PrecisionDefinition):
         elif typestring == 'bfloat16':
             typestring = 'std::bfloat16_t'
         return typestring
+
+
+class APPositPrecisionDefinition(PrecisionDefinition):
+    def definition_cpp(self):
+        return f'nnet::posit<{self.width},{self.es}>'
 
 
 class ACIntegerPrecisionDefinition(PrecisionDefinition):
@@ -181,6 +187,7 @@ class APTypeConverter(FPGAPrecisionConverter):
                 IntegerPrecisionType: APIntegerPrecisionDefinition,
                 FloatPrecisionType: APFloatPrecisionDefinition,
                 StandardFloatPrecisionType: APStandardFloatPrecisionDefinition,
+                PositPrecisionType: APPositPrecisionDefinition,
                 ExponentPrecisionType: APIntegerPrecisionDefinition,
                 XnorPrecisionType: APIntegerPrecisionDefinition,
             },
