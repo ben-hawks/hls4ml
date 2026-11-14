@@ -1,6 +1,7 @@
 import numpy as np
 
 from hls4ml.model.types import (
+    CodebookPrecisionType,
     CompressedType,
     ExponentPrecisionType,
     ExponentType,
@@ -70,6 +71,32 @@ class APStandardFloatPrecisionDefinition(PrecisionDefinition):
         elif typestring == 'bfloat16':
             typestring = 'std::bfloat16_t'
         return typestring
+
+
+class APLookupTableDefinition(PrecisionDefinition):
+    """Weights stored as codes, decoded with a per-type table of fixed-point values."""
+
+    def typedef_cpp(self, name):
+        dp = self.decode_precision()
+        decode = f'ap_fixed<{dp.width},{dp.integer}>'
+        fmt = f'{{:.{max(dp.fractional, 0)}f}}'
+        values = ', '.join(fmt.format(v) for v in self.lookup_table())
+        return (
+            f'struct {name}_table {{\n'
+            f'    static {decode} lookup(unsigned code) {{\n'
+            f'        #pragma HLS INLINE\n'
+            f'        static const {decode} values[{1 << self.width}] = {{{values}}};\n'
+            f'        #pragma HLS BIND_STORAGE variable=values type=rom_np impl=lutram\n'
+            f'        return values[code];\n'
+            f'    }}\n'
+            f'}};\n'
+            f'typedef nnet::lut_weight<{self.width}, {decode}, {name}_table> {name};\n'
+        )
+
+
+class APCodebookPrecisionDefinition(APLookupTableDefinition):
+    def definition_cpp(self):
+        raise NotImplementedError('Codebook types need a named typedef, use typedef_cpp(name)')
 
 
 class ACIntegerPrecisionDefinition(PrecisionDefinition):
@@ -181,6 +208,7 @@ class APTypeConverter(FPGAPrecisionConverter):
                 IntegerPrecisionType: APIntegerPrecisionDefinition,
                 FloatPrecisionType: APFloatPrecisionDefinition,
                 StandardFloatPrecisionType: APStandardFloatPrecisionDefinition,
+                CodebookPrecisionType: APCodebookPrecisionDefinition,
                 ExponentPrecisionType: APIntegerPrecisionDefinition,
                 XnorPrecisionType: APIntegerPrecisionDefinition,
             },
@@ -220,6 +248,8 @@ class TypePrecisionConverter:
 
 class NamedTypeConverter(TypeDefinition, TypePrecisionConverter):
     def definition_cpp(self):
+        if hasattr(self.precision, 'typedef_cpp'):
+            return self.precision.typedef_cpp(self.name)
         return f'typedef {self.precision.definition_cpp()} {self.name};\n'
 
 

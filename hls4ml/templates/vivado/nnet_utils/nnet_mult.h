@@ -4,6 +4,7 @@
 #include "hls_stream.h"
 #include "nnet_common.h"
 #include "nnet_helpers.h"
+#include "nnet_lut_weight.h"
 #include <iostream>
 #include <math.h>
 
@@ -86,6 +87,15 @@ template <class x_T, class w_T> class weight_exponential : public Product {
 
         // Negate or not depending on weight sign
         return w.sign == 1 ? y : static_cast<r_T>(-y);
+    }
+};
+
+template <class x_T, class w_T> class weight_decode : public Product {
+  public:
+    static auto product(x_T a, w_T w) -> decltype(a * w.decode()) {
+        // Codebook weights are decoded to fixed point, then multiplied as usual
+        #pragma HLS INLINE
+        return a * w.decode();
     }
 };
 

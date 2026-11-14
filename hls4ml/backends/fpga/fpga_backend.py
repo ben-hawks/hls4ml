@@ -41,6 +41,7 @@ from hls4ml.model.layers import (
 )
 from hls4ml.model.optimizer import model_optimizer
 from hls4ml.model.types import (
+    CodebookPrecisionType,
     ExponentPrecisionType,
     FixedPrecisionType,
     FloatPrecisionType,
@@ -396,6 +397,9 @@ class FPGABackend(Backend):
         if precision.startswith('ac_float'):
             return cls._convert_ac_float_type(precision)
 
+        if precision.startswith('codebook'):
+            return cls._convert_codebook_type(precision)
+
         if precision.startswith('ac_'):
             return cls._convert_ac_type(precision)
 
@@ -511,6 +515,13 @@ class FPGABackend(Backend):
             raise ValueError(f'Invalid ac_float precision format: {precision}')
 
     @classmethod
+    def _convert_codebook_type(cls, precision):
+        match = re.fullmatch(r'codebook<\s*(\d+)\s*,\s*(\d+)\s*>', precision.strip())
+        if match is None:
+            raise ValueError(f'Invalid codebook precision format: {precision} (expected codebook<width,decode_width>)')
+        return CodebookPrecisionType(width=int(match.group(1)), decode_width=int(match.group(2)))
+
+    @classmethod
     def _convert_auto_type(cls, precision):
         """
         Convert a "auto" precision string into the UnspecifiedPrecisionType
@@ -524,9 +535,12 @@ class FPGABackend(Backend):
         assert not isinstance(data_T, ExponentPrecisionType), (
             "Only ExponentPrecisionType (aka 'power of 2') weights are currently supported, not data."
         )
+        assert not isinstance(data_T, CodebookPrecisionType), 'Codebook types are only supported for weights, not data.'
         product = 'mult'
         if isinstance(weight_T, ExponentPrecisionType):
             product = 'weight_exponential'
+        elif isinstance(weight_T, CodebookPrecisionType):
+            product = 'weight_decode'
         else:
             # if binary
             if isinstance(weight_T, XnorPrecisionType) and isinstance(data_T, XnorPrecisionType):

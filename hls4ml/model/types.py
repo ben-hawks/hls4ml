@@ -5,6 +5,7 @@ The Precision types are given names for convenience (``NamedType``). Named types
 higher-dimensional tensors, which are defined as arrays or FIFO streams in the generated code.
 """
 
+import copy
 import math
 from enum import Enum
 
@@ -424,6 +425,167 @@ class StandardFloatPrecisionType(PrecisionType):
         return state
 
 
+class CodebookPrecisionType(PrecisionType):
+    """
+    Class representing a codebook<width, decode_width> type, used for weight storage only.
+
+    Values are stored as ``width``-bit indices into a table of up to ``2**width`` signed fixed-point values with
+    ``decode_width`` bits. ``fitted()`` chooses the table for a given tensor with optimal 1-D k-means, then rounds the
+    entries to a fixed-point type whose integer bits cover the tensor's range. Arithmetic is done in fixed point.
+
+    Args:
+        width (int, optional): Number of index bits. Defaults to 4.
+        decode_width (int, optional): Width of the fixed-point table entries. Defaults to 16.
+        decode_integer (int, optional): Integer bits of the table entries. Defaults to ``None`` (set by ``fitted()``).
+        values (list, optional): Table entries in increasing order. Defaults to ``None`` (set by ``fitted()``).
+    """
+
+    def __init__(self, width=4, decode_width=16, decode_integer=None, values=None):
+        if width < 1:
+            raise ValueError(f'Codebook width must be at least 1, got {width}')
+        if decode_width < 2:
+            raise ValueError(f'Codebook decode_width must be at least 2, got {decode_width}')
+        super().__init__(width=width, signed=True)
+        self.decode_width = decode_width
+        self.decode_integer = decode_integer
+        self.values = None if values is None else tuple(float(v) for v in values)
+
+    def __str__(self):
+        return f'codebook<{self.width},{self.decode_width}>'
+
+    def _key(self):
+        return (self.width, self.decode_width, self.decode_integer, self.values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CodebookPrecisionType) and self._key() == other._key()
+
+    def __hash__(self) -> int:
+        return hash(self._key())
+
+    @property
+    def is_fitted(self):
+        return self.values is not None
+
+    @property
+    def uses_table(self):
+        return self.is_fitted
+
+    def decode_precision(self):
+        """The fixed-point type of the table entries."""
+        if not self.is_fitted:
+            raise RuntimeError(f'{self} has not been fitted to any data')
+        return FixedPrecisionType(width=self.decode_width, integer=self.decode_integer, signed=True)
+
+    max_bins = 4096  # Larger tensors are binned before clustering, which bounds the cost of the exact fit
+
+    @classmethod
+    def _kmeans_1d(cls, x, k):
+        """
+        Optimal 1-D k-means (minimum squared error), by dynamic programming over the sorted values with the
+        divide-and-conquer speed-up that the monotone optimal split points allow. Values are first merged into at most
+        ``max_bins`` equal-width bins, each standing at the mean of its values.
+        """
+        x = np.sort(np.asarray(x, dtype=np.float64).ravel())
+        points, counts = np.unique(x, return_counts=True)
+        if len(points) > cls.max_bins:
+            edges = np.linspace(points[0], points[-1], cls.max_bins + 1)[1:-1]
+            idx = np.searchsorted(edges, x, side='right')
+            counts = np.bincount(idx, minlength=cls.max_bins)
+            sums = np.bincount(idx, weights=x, minlength=cls.max_bins)
+            keep = counts > 0
+            points, counts = sums[keep] / counts[keep], counts[keep]
+        n = len(points)
+        if n <= k:
+            return points
+        w = np.concatenate([[0.0], np.cumsum(counts)])
+        s1 = np.concatenate([[0.0], np.cumsum(counts * points)])
+        s2 = np.concatenate([[0.0], np.cumsum(counts * points**2)])
+
+        def cost(i, j):  # Squared error of points[i:j] as one cluster, i may be an array
+            return (s2[j] - s2[i]) - (s1[j] - s1[i]) ** 2 / (w[j] - w[i])
+
+        prev = np.full(n + 1, np.inf)
+        prev[0] = 0.0
+        splits = []
+        for m in range(1, k + 1):
+            cur = np.full(n + 1, np.inf)
+            arg = np.zeros(n + 1, dtype=np.int64)
+            stack = [(m, n, m - 1, n - 1)]  # Fill cur[j] for j in [jlo, jhi], best split in [ilo, ihi]
+            while stack:
+                jlo, jhi, ilo, ihi = stack.pop()
+                if jlo > jhi:
+                    continue
+                j = (jlo + jhi) // 2
+                i = np.arange(ilo, min(ihi, j - 1) + 1)
+                c = prev[i] + cost(i, j)
+                b = int(np.argmin(c))
+                cur[j], arg[j] = c[b], i[b]
+                stack.append((jlo, j - 1, ilo, i[b]))
+                stack.append((j + 1, jhi, i[b], ihi))
+            splits.append(arg)
+            prev = cur
+        bounds = [n]
+        for arg in reversed(splits):
+            bounds.append(int(arg[bounds[-1]]))
+        bounds = bounds[::-1]
+        return np.array([(s1[b] - s1[a]) / (w[b] - w[a]) for a, b in zip(bounds[:-1], bounds[1:])])
+
+    def fitted(self, data):
+        """Return a copy whose table is fitted to ``data``."""
+        data = np.asarray(data, dtype=np.float64)
+        centers = self._kmeans_1d(data, 1 << self.width) if data.size else np.zeros(1)
+        max_abs = np.max(np.abs(centers))
+        # Integer bits cover the largest entry after rounding, so refitting to quantized data is stable
+        decode_integer = int(np.frexp(max_abs)[1]) + 1 if max_abs > 0 else 1
+        while True:
+            step = 2.0 ** (decode_integer - self.decode_width)
+            values = np.unique(np.round(centers / step) * step)
+            if np.max(np.abs(values)) < 2.0 ** (decode_integer - 1):
+                break
+            decode_integer += 1
+        if data.size:
+            # Keep only entries that some value maps to
+            nearest = np.searchsorted((values[1:] + values[:-1]) / 2, data.ravel(), side='left')
+            values = values[np.unique(nearest)]
+            # Dropping the largest entry can free an integer bit; the entries stay exact with the finer step
+            max_abs = np.max(np.abs(values))
+            if max_abs > 0:
+                decode_integer = min(decode_integer, int(np.frexp(max_abs)[1]) + 1)
+        new = copy.copy(self)  # Keep any backend-specific wrapping of the class
+        new.decode_integer = decode_integer
+        new.values = tuple(float(v) for v in values)
+        return new
+
+    def lookup_table(self):
+        """Table entry of every index, with indices beyond the fitted entries set to zero."""
+        table = np.zeros(1 << self.width)
+        table[: len(self.values)] = self.values
+        return table
+
+    def encode(self, x):
+        """Return the index (int64) of the nearest table entry, ties to the lower entry."""
+        if not self.is_fitted:
+            raise RuntimeError(f'{self} has not been fitted to any data')
+        x = np.asarray(x, dtype=np.float64)
+        values = np.array(self.values)
+        return np.searchsorted((values[1:] + values[:-1]) / 2, x, side='left').astype(np.int64)
+
+    def decode(self, codes):
+        return self.lookup_table()[np.asarray(codes, dtype=np.int64)]
+
+    def quantize(self, x):
+        """Round values to the nearest table entry (float64)."""
+        return self.decode(self.encode(x))
+
+    def serialize_state(self):
+        return {
+            'width': self.width,
+            'decode_width': self.decode_width,
+            'decode_integer': self.decode_integer,
+            'values': None if self.values is None else list(self.values),
+        }
+
+
 class UnspecifiedPrecisionType(PrecisionType):
     """
     Class representing an unspecified precision type.
@@ -712,6 +874,8 @@ class WeightVariable(Variable):
         if not self._iterator.finished:
             value = self._iterator[0]
             self._iterator.iternext()
+            if isinstance(self.type.precision, CodebookPrecisionType):
+                value = int(self.type.precision.encode(value))
             return self.precision_fmt.format(value)
         else:
             raise StopIteration
@@ -724,6 +888,11 @@ class WeightVariable(Variable):
             self.precision_fmt = ''  # Temporarily set precision to undefined value
         elif isinstance(new_precision, (IntegerPrecisionType, XnorPrecisionType, ExponentPrecisionType)):
             self.precision_fmt = '{:.0f}'
+        elif isinstance(new_precision, CodebookPrecisionType):
+            if not new_precision.is_fitted:
+                # Fit the table to these weights; also updates the layer's type, which is self.type
+                self.type.precision = new_precision.fitted(self.data)
+            self.precision_fmt = '{:d}'  # Table indices
         elif isinstance(new_precision, FixedPrecisionType):
             decimal_spaces = max(0, new_precision.fractional)
             self.precision_fmt = f'{{:.{decimal_spaces}f}}'
