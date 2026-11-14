@@ -75,6 +75,8 @@ class APStandardFloatPrecisionDefinition(PrecisionDefinition):
 
 class APPositPrecisionDefinition(PrecisionDefinition):
     def definition_cpp(self):
+        if self.is_narrowed:
+            return f'nnet::posit<{self.width},{self.es},{self.decode_width},{self.decode_integer}>'
         return f'nnet::posit<{self.width},{self.es}>'
 
 

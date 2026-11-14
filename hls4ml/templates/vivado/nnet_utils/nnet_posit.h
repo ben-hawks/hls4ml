@@ -10,14 +10,16 @@
 
 namespace nnet {
 
-// Storage-only posit<N, ES>: holds the raw N-bit code. decode() returns the value as a fixed-point
-// number wide enough to represent every posit<N, ES> value exactly, so arithmetic stays in fixed point.
-template <int N, int ES> struct posit {
+// Storage-only posit<N, ES>: holds the raw N-bit code. decode() returns the value as ap_fixed<W, I>, so arithmetic
+// stays in fixed point. The default W, I represent every posit<N, ES> value exactly; a narrower W, I is exact only
+// for the codes within its range, which hls4ml chooses to cover the weights of a given layer.
+template <int N, int ES, int W = 2 * ((N - 2) << ES) + 2, int I = ((N - 2) << ES) + 2> struct posit {
     static_assert(N >= 2 && N <= 32, "posit width must be between 2 and 32");
     static_assert(ES >= 0 && ES <= 4, "posit es must be between 0 and 4");
 
     static const int max_scale = (N - 2) << ES; // maxpos = 2^max_scale, minpos = 2^-max_scale
-    typedef ap_fixed<2 * max_scale + 2, max_scale + 2> decode_t;
+    typedef ap_fixed<2 * max_scale + 2, max_scale + 2> full_t;
+    typedef ap_fixed<W, I> decode_t;
 
     ap_uint<N> bits;
 
@@ -25,6 +27,11 @@ template <int N, int ES> struct posit {
     posit(unsigned long long b) : bits(b) {}
 
     decode_t decode() const {
+        #pragma HLS INLINE
+        return decode_t(decode_full());
+    }
+
+    full_t decode_full() const {
         #pragma HLS INLINE
         const ap_uint<N> nar = ap_uint<N>(1) << (N - 1);
         if (bits == 0 || bits == nar)
@@ -63,17 +70,17 @@ template <int N, int ES> struct posit {
         const unsigned sig = (1u << nf) | (tail & ((1u << nf) - 1));
         const int scale = k * (1 << ES) + int(e) - nf;
 
-        decode_t v = sig;
+        full_t v = sig;
         if (scale >= 0)
             v = v << scale;
         else
             v = v >> -scale;
-        return sign ? decode_t(-v) : v;
+        return sign ? full_t(-v) : v;
     }
 };
 
 #ifndef __SYNTHESIS__
-template <int N, int ES> std::istream &operator>>(std::istream &in, posit<N, ES> &p) {
+template <int N, int ES, int W, int I> std::istream &operator>>(std::istream &in, posit<N, ES, W, I> &p) {
     unsigned long long b;
     in >> b;
     p.bits = b;

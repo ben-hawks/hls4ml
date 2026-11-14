@@ -61,6 +61,29 @@ def test_posit_encode_decode(width, es):
     assert ptype.quantize([0.0])[0] == 0
 
 
+@pytest.mark.parametrize('width, es', [(6, 1), (8, 0), (8, 1), (8, 2)])
+@pytest.mark.parametrize('scale', [0.05, 0.5, 4.0])
+def test_posit_narrowed(width, es, scale):
+    ptype = PositPrecisionType(width, es)
+    data = np.random.default_rng(2).normal(scale=scale, size=(16, 12))
+    narrow = ptype.narrowed(data)
+    assert narrow.is_narrowed and not ptype.is_narrowed
+    assert PositPrecisionType.deserialize(narrow.serialize_state()) == narrow
+    assert np.array_equal(narrow.encode(data), ptype.encode(data))
+
+    def exact(w, i):
+        q = ptype.quantize(data)
+        return np.all(np.mod(q * 2.0 ** (w - i), 1) == 0) and np.all(np.abs(q) < 2.0 ** (i - 1))
+
+    dp = narrow.decode_precision()
+    full = ptype.decode_precision()
+    assert dp.width <= full.width and dp.integer <= full.integer
+    assert exact(dp.width, dp.integer)
+    # One bit fewer integer or fractional bits is no longer exact
+    assert not exact(dp.width - 1, dp.integer - 1)
+    assert not exact(dp.width - 1, dp.integer)
+
+
 def _posit_model(ptype, seed=0):
     import keras
 
@@ -92,16 +115,16 @@ def test_posit_weights_dense(test_case_id, width, es, io_type, strategy):
     X = np.random.default_rng(1).uniform(-2, 2, size=(200, 16)).astype(np.float32)
 
     predictions = {}
-    for weight_precision in (str(ptype), f'fixed<{ptype.decode_precision().width},{ptype.decode_precision().integer}>'):
+    weight_precisions = {'dense1': str(ptype), 'dense2': str(ptype)}
+    for suffix in ('posit', 'fixed'):
         config = hls4ml.utils.config_from_keras_model(
             model, granularity='name', default_precision='fixed<16,6>', backend='Vitis'
         )
         config['Model']['Strategy'] = strategy
         for name in ('dense1', 'dense2'):
-            config['LayerName'][name]['Precision']['weight'] = weight_precision
+            config['LayerName'][name]['Precision']['weight'] = weight_precisions[name]
             config['LayerName'][name]['ReuseFactor'] = 4 if strategy == 'Resource' else 1
 
-        suffix = 'posit' if weight_precision.startswith('posit') else 'fixed'
         output_dir = str(test_root_path / f'{test_case_id}_{suffix}')
         hls_model = hls4ml.converters.convert_from_keras_model(
             model, hls_config=config, output_dir=output_dir, backend='Vitis', io_type=io_type
@@ -110,7 +133,14 @@ def test_posit_weights_dense(test_case_id, width, es, io_type, strategy):
         predictions[suffix] = hls_model.predict(X)
 
         if suffix == 'posit':
-            assert f'nnet::posit<{width},{es}>' in Path(output_dir, 'firmware', 'defines.h').read_text()
+            defines = Path(output_dir, 'firmware', 'defines.h').read_text()
+            for name in ('dense1', 'dense2'):
+                # The decode type is narrowed to each layer's weights; the fixed point reference uses the same type
+                wp = hls_model.graph[name].get_attr('weight_t').precision
+                dp = wp.decode_precision()
+                assert wp.is_narrowed and dp.width <= ptype.decode_precision().width
+                assert f'nnet::posit<{width},{es},{dp.width},{dp.integer}>' in defines
+                weight_precisions[name] = f'fixed<{dp.width},{dp.integer}>'
             weights = Path(output_dir, 'firmware', 'weights', 'w2.h').read_text()
             codes = weights.split('= {')[1].split('}')[0].split(',')
             assert all(0 <= int(c) < (1 << width) for c in codes)

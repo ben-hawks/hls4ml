@@ -5,6 +5,7 @@ The Precision types are given names for convenience (``NamedType``). Named types
 higher-dimensional tensors, which are defined as arrays or FIFO streams in the generated code.
 """
 
+import copy
 import math
 from enum import Enum
 
@@ -429,40 +430,76 @@ class PositPrecisionType(PrecisionType):
     Class representing a posit<width, es> type, used for weight storage only.
 
     Values are stored as raw ``width``-bit posit codes and decoded in hardware to the fixed-point type returned by
-    ``decode_precision()``, which represents every posit value exactly. Arithmetic is done in fixed point.
+    ``decode_precision()``. Arithmetic is done in fixed point. By default the decode type represents every posit value
+    exactly; ``narrowed()`` restricts it to the values a given tensor actually uses.
 
     Args:
         width (int, optional): Total number of bits used. Defaults to 8.
         es (int, optional): Number of exponent bits. Defaults to 0.
+        decode_width (int, optional): Width of the fixed-point decode type. Defaults to ``None`` (full posit range).
+        decode_integer (int, optional): Integer bits of the fixed-point decode type. Defaults to ``None``.
     """
 
-    def __init__(self, width=8, es=0):
+    def __init__(self, width=8, es=0, decode_width=None, decode_integer=None):
         if width < 2:
             raise ValueError(f'Posit width must be at least 2, got {width}')
         if es < 0:
             raise ValueError(f'Posit es must be non-negative, got {es}')
+        if (decode_width is None) != (decode_integer is None):
+            raise ValueError('decode_width and decode_integer must be given together')
         super().__init__(width=width, signed=True)
         self.es = es
+        self.decode_width = decode_width
+        self.decode_integer = decode_integer
 
     def __str__(self):
         return f'posit<{self.width},{self.es}>'
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, PositPrecisionType):
-            return super().__eq__(other) and self.es == other.es
+            eq = super().__eq__(other) and self.es == other.es
+            return eq and (self.decode_width, self.decode_integer) == (other.decode_width, other.decode_integer)
         return False
 
     def __hash__(self) -> int:
-        return super().__hash__() ^ hash(self.es)
+        return super().__hash__() ^ hash((self.es, self.decode_width, self.decode_integer))
 
     @property
     def max_scale(self):
         """log2 of the largest posit value (maxpos); the smallest positive value (minpos) is 2**-max_scale."""
         return (self.width - 2) << self.es
 
+    @property
+    def is_narrowed(self):
+        return self.decode_width is not None
+
     def decode_precision(self):
-        """The narrowest fixed-point type that represents every value of this posit exactly."""
+        """The fixed-point type posit codes are decoded to before the product."""
+        if self.is_narrowed:
+            return FixedPrecisionType(width=self.decode_width, integer=self.decode_integer, signed=True)
         return FixedPrecisionType(width=2 * self.max_scale + 2, integer=self.max_scale + 2, signed=True)
+
+    def narrowed(self, data):
+        """
+        Return a copy whose decode type is the narrowest signed fixed-point type that represents every value of
+        ``data`` (after rounding to this posit) exactly. Codes outside that range would decode incorrectly, so the
+        result is only valid for this data.
+        """
+        values = np.abs(self.quantize(data))
+        values = values[values > 0]
+        if values.size == 0:
+            decode_width, decode_integer = 2, 2
+        else:
+            _, exp = np.frexp(values.max())  # max = m * 2**exp, 0.5 <= m < 1
+            decode_integer = int(exp) + 1  # sign bit plus the bits up to and including 2**(exp-1)
+            fractional = -decode_integer + 2
+            while not np.all(np.mod(values * 2.0**fractional, 1) == 0):
+                fractional += 1
+            decode_width = max(decode_integer + fractional, 2)
+        new = copy.copy(self)  # Keep any backend-specific wrapping of the class
+        new.decode_width = decode_width
+        new.decode_integer = decode_integer
+        return new
 
     def decode(self, codes):
         """Decode an array of raw posit codes to their values (float64). NaR is returned as NaN."""
@@ -538,7 +575,12 @@ class PositPrecisionType(PrecisionType):
         return self.decode(self.encode(x))
 
     def serialize_state(self):
-        return {'width': self.width, 'es': self.es}
+        return {
+            'width': self.width,
+            'es': self.es,
+            'decode_width': self.decode_width,
+            'decode_integer': self.decode_integer,
+        }
 
 
 class UnspecifiedPrecisionType(PrecisionType):
@@ -844,6 +886,9 @@ class WeightVariable(Variable):
         elif isinstance(new_precision, (IntegerPrecisionType, XnorPrecisionType, ExponentPrecisionType)):
             self.precision_fmt = '{:.0f}'
         elif isinstance(new_precision, PositPrecisionType):
+            if not new_precision.is_narrowed:
+                # Decode only to the range these weights use; also updates the layer's type, which is self.type
+                self.type.precision = new_precision.narrowed(self.data)
             self.precision_fmt = '{:d}'  # Raw posit codes
         elif isinstance(new_precision, FixedPrecisionType):
             decimal_spaces = max(0, new_precision.fractional)
