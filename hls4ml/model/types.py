@@ -431,16 +431,20 @@ class PositPrecisionType(PrecisionType):
 
     Values are stored as raw ``width``-bit posit codes and decoded in hardware to the fixed-point type returned by
     ``decode_precision()``. Arithmetic is done in fixed point. By default the decode type represents every posit value
-    exactly; ``narrowed()`` restricts it to the values a given tensor actually uses.
+    exactly; ``fitted()`` restricts it to the values a given tensor actually uses and records which codes those are,
+    so that small posits can be decoded with a lookup table.
 
     Args:
         width (int, optional): Total number of bits used. Defaults to 8.
         es (int, optional): Number of exponent bits. Defaults to 0.
         decode_width (int, optional): Width of the fixed-point decode type. Defaults to ``None`` (full posit range).
         decode_integer (int, optional): Integer bits of the fixed-point decode type. Defaults to ``None``.
+        used_codes (list, optional): Codes used by the tensor this type was fitted to. Defaults to ``None``.
     """
 
-    def __init__(self, width=8, es=0, decode_width=None, decode_integer=None):
+    max_table_width = 10  # Wider posits are decoded arithmetically instead of with a lookup table
+
+    def __init__(self, width=8, es=0, decode_width=None, decode_integer=None, used_codes=None):
         if width < 2:
             raise ValueError(f'Posit width must be at least 2, got {width}')
         if es < 0:
@@ -451,18 +455,19 @@ class PositPrecisionType(PrecisionType):
         self.es = es
         self.decode_width = decode_width
         self.decode_integer = decode_integer
+        self.used_codes = None if used_codes is None else tuple(int(c) for c in used_codes)
 
     def __str__(self):
         return f'posit<{self.width},{self.es}>'
 
+    def _key(self):
+        return (self.width, self.es, self.decode_width, self.decode_integer, self.used_codes)
+
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, PositPrecisionType):
-            eq = super().__eq__(other) and self.es == other.es
-            return eq and (self.decode_width, self.decode_integer) == (other.decode_width, other.decode_integer)
-        return False
+        return isinstance(other, PositPrecisionType) and self._key() == other._key()
 
     def __hash__(self) -> int:
-        return super().__hash__() ^ hash((self.es, self.decode_width, self.decode_integer))
+        return hash(self._key())
 
     @property
     def max_scale(self):
@@ -470,22 +475,27 @@ class PositPrecisionType(PrecisionType):
         return (self.width - 2) << self.es
 
     @property
-    def is_narrowed(self):
+    def is_fitted(self):
         return self.decode_width is not None
+
+    @property
+    def uses_table(self):
+        return self.used_codes is not None and self.width <= self.max_table_width
 
     def decode_precision(self):
         """The fixed-point type posit codes are decoded to before the product."""
-        if self.is_narrowed:
+        if self.is_fitted:
             return FixedPrecisionType(width=self.decode_width, integer=self.decode_integer, signed=True)
         return FixedPrecisionType(width=2 * self.max_scale + 2, integer=self.max_scale + 2, signed=True)
 
-    def narrowed(self, data):
+    def fitted(self, data):
         """
-        Return a copy whose decode type is the narrowest signed fixed-point type that represents every value of
-        ``data`` (after rounding to this posit) exactly. Codes outside that range would decode incorrectly, so the
-        result is only valid for this data.
+        Return a copy fitted to ``data``: the decode type becomes the narrowest signed fixed-point type that represents
+        every value of ``data`` (after rounding to this posit) exactly, and the codes ``data`` uses are recorded. Other
+        codes may decode incorrectly, so the result is only valid for this data.
         """
-        values = np.abs(self.quantize(data))
+        codes = np.unique(self.encode(data))
+        values = np.abs(self.decode(codes))
         values = values[values > 0]
         if values.size == 0:
             decode_width, decode_integer = 2, 2
@@ -499,7 +509,16 @@ class PositPrecisionType(PrecisionType):
         new = copy.copy(self)  # Keep any backend-specific wrapping of the class
         new.decode_width = decode_width
         new.decode_integer = decode_integer
+        new.used_codes = tuple(int(c) for c in codes)
         return new
+
+    def lookup_table(self):
+        """Decoded value of every code, with codes not used by the fitted tensor set to zero."""
+        table = np.zeros(1 << self.width)
+        if self.used_codes is not None:
+            codes = np.array(self.used_codes, dtype=np.int64)
+            table[codes] = self.decode(codes)
+        return table
 
     def decode(self, codes):
         """Decode an array of raw posit codes to their values (float64). NaR is returned as NaN."""
@@ -580,6 +599,132 @@ class PositPrecisionType(PrecisionType):
             'es': self.es,
             'decode_width': self.decode_width,
             'decode_integer': self.decode_integer,
+            'used_codes': None if self.used_codes is None else list(self.used_codes),
+        }
+
+
+class CodebookPrecisionType(PrecisionType):
+    """
+    Class representing a codebook<width, decode_width> type, used for weight storage only.
+
+    Values are stored as ``width``-bit indices into a table of up to ``2**width`` signed fixed-point values with
+    ``decode_width`` bits. ``fitted()`` chooses the table for a given tensor with 1-D k-means, then rounds the entries to
+    a fixed-point type whose integer bits cover the tensor's range. Arithmetic is done in fixed point.
+
+    Args:
+        width (int, optional): Number of index bits. Defaults to 4.
+        decode_width (int, optional): Width of the fixed-point table entries. Defaults to 16.
+        decode_integer (int, optional): Integer bits of the table entries. Defaults to ``None`` (set by ``fitted()``).
+        values (list, optional): Table entries in increasing order. Defaults to ``None`` (set by ``fitted()``).
+    """
+
+    def __init__(self, width=4, decode_width=16, decode_integer=None, values=None):
+        if width < 1:
+            raise ValueError(f'Codebook width must be at least 1, got {width}')
+        if decode_width < 2:
+            raise ValueError(f'Codebook decode_width must be at least 2, got {decode_width}')
+        super().__init__(width=width, signed=True)
+        self.decode_width = decode_width
+        self.decode_integer = decode_integer
+        self.values = None if values is None else tuple(float(v) for v in values)
+
+    def __str__(self):
+        return f'codebook<{self.width},{self.decode_width}>'
+
+    def _key(self):
+        return (self.width, self.decode_width, self.decode_integer, self.values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CodebookPrecisionType) and self._key() == other._key()
+
+    def __hash__(self) -> int:
+        return hash(self._key())
+
+    @property
+    def is_fitted(self):
+        return self.values is not None
+
+    @property
+    def uses_table(self):
+        return self.is_fitted
+
+    def decode_precision(self):
+        """The fixed-point type of the table entries."""
+        if not self.is_fitted:
+            raise RuntimeError(f'{self} has not been fitted to any data')
+        return FixedPrecisionType(width=self.decode_width, integer=self.decode_integer, signed=True)
+
+    @staticmethod
+    def _kmeans_1d(x, k, max_iter=300):
+        """Lloyd's algorithm in one dimension, initialized at the quantiles."""
+        x = np.sort(np.asarray(x, dtype=np.float64).ravel())
+        unique = np.unique(x)
+        if len(unique) <= k:
+            return unique
+        centers = np.quantile(x, (np.arange(k) + 0.5) / k)
+        for _ in range(max_iter):
+            idx = np.searchsorted((centers[1:] + centers[:-1]) / 2, x)
+            counts = np.bincount(idx, minlength=k)
+            sums = np.bincount(idx, weights=x, minlength=k)
+            new = np.sort(np.where(counts > 0, sums / np.maximum(counts, 1), centers))
+            if np.array_equal(new, centers):
+                break
+            centers = new
+        return centers
+
+    def fitted(self, data):
+        """Return a copy whose table is fitted to ``data``."""
+        data = np.asarray(data, dtype=np.float64)
+        centers = self._kmeans_1d(data, 1 << self.width) if data.size else np.zeros(1)
+        max_abs = np.max(np.abs(centers))
+        # Integer bits cover the largest entry after rounding, so refitting to quantized data is stable
+        decode_integer = int(np.frexp(max_abs)[1]) + 1 if max_abs > 0 else 1
+        while True:
+            step = 2.0 ** (decode_integer - self.decode_width)
+            values = np.unique(np.round(centers / step) * step)
+            if np.max(np.abs(values)) < 2.0 ** (decode_integer - 1):
+                break
+            decode_integer += 1
+        if data.size:
+            # Keep only entries that some value maps to
+            nearest = np.searchsorted((values[1:] + values[:-1]) / 2, data.ravel(), side='left')
+            values = values[np.unique(nearest)]
+            # Dropping the largest entry can free an integer bit; the entries stay exact with the finer step
+            max_abs = np.max(np.abs(values))
+            if max_abs > 0:
+                decode_integer = min(decode_integer, int(np.frexp(max_abs)[1]) + 1)
+        new = copy.copy(self)  # Keep any backend-specific wrapping of the class
+        new.decode_integer = decode_integer
+        new.values = tuple(float(v) for v in values)
+        return new
+
+    def lookup_table(self):
+        """Table entry of every index, with indices beyond the fitted entries set to zero."""
+        table = np.zeros(1 << self.width)
+        table[: len(self.values)] = self.values
+        return table
+
+    def encode(self, x):
+        """Return the index (int64) of the nearest table entry, ties to the lower entry."""
+        if not self.is_fitted:
+            raise RuntimeError(f'{self} has not been fitted to any data')
+        x = np.asarray(x, dtype=np.float64)
+        values = np.array(self.values)
+        return np.searchsorted((values[1:] + values[:-1]) / 2, x, side='left').astype(np.int64)
+
+    def decode(self, codes):
+        return self.lookup_table()[np.asarray(codes, dtype=np.int64)]
+
+    def quantize(self, x):
+        """Round values to the nearest table entry (float64)."""
+        return self.decode(self.encode(x))
+
+    def serialize_state(self):
+        return {
+            'width': self.width,
+            'decode_width': self.decode_width,
+            'decode_integer': self.decode_integer,
+            'values': None if self.values is None else list(self.values),
         }
 
 
@@ -871,7 +1016,7 @@ class WeightVariable(Variable):
         if not self._iterator.finished:
             value = self._iterator[0]
             self._iterator.iternext()
-            if isinstance(self.type.precision, PositPrecisionType):
+            if isinstance(self.type.precision, (PositPrecisionType, CodebookPrecisionType)):
                 value = int(self.type.precision.encode(value))
             return self.precision_fmt.format(value)
         else:
@@ -885,10 +1030,10 @@ class WeightVariable(Variable):
             self.precision_fmt = ''  # Temporarily set precision to undefined value
         elif isinstance(new_precision, (IntegerPrecisionType, XnorPrecisionType, ExponentPrecisionType)):
             self.precision_fmt = '{:.0f}'
-        elif isinstance(new_precision, PositPrecisionType):
-            if not new_precision.is_narrowed:
-                # Decode only to the range these weights use; also updates the layer's type, which is self.type
-                self.type.precision = new_precision.narrowed(self.data)
+        elif isinstance(new_precision, (PositPrecisionType, CodebookPrecisionType)):
+            if not new_precision.is_fitted:
+                # Fit the decode type/table to these weights; also updates the layer's type, which is self.type
+                self.type.precision = new_precision.fitted(self.data)
             self.precision_fmt = '{:d}'  # Raw posit codes
         elif isinstance(new_precision, FixedPrecisionType):
             decimal_spaces = max(0, new_precision.fractional)

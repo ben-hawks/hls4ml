@@ -1,6 +1,7 @@
 import numpy as np
 
 from hls4ml.model.types import (
+    CodebookPrecisionType,
     CompressedType,
     ExponentPrecisionType,
     ExponentType,
@@ -73,11 +74,41 @@ class APStandardFloatPrecisionDefinition(PrecisionDefinition):
         return typestring
 
 
-class APPositPrecisionDefinition(PrecisionDefinition):
+class APLookupTableDefinition(PrecisionDefinition):
+    """Weights stored as codes, decoded with a per-type table of fixed-point values (posit or codebook)."""
+
+    def typedef_cpp(self, name):
+        dp = self.decode_precision()
+        decode = f'ap_fixed<{dp.width},{dp.integer}>'
+        fmt = f'{{:.{max(dp.fractional, 0)}f}}'
+        values = ', '.join(fmt.format(v) for v in self.lookup_table())
+        return (
+            f'struct {name}_table {{\n'
+            f'    static {decode} lookup(unsigned code) {{\n'
+            f'        #pragma HLS INLINE\n'
+            f'        static const {decode} values[{1 << self.width}] = {{{values}}};\n'
+            f'        return values[code];\n'
+            f'    }}\n'
+            f'}};\n'
+            f'typedef nnet::lut_weight<{self.width}, {decode}, {name}_table> {name};\n'
+        )
+
+
+class APPositPrecisionDefinition(APLookupTableDefinition):
+    def typedef_cpp(self, name):
+        if self.uses_table:
+            return super().typedef_cpp(name)
+        return f'typedef {self.definition_cpp()} {name};\n'
+
     def definition_cpp(self):
-        if self.is_narrowed:
+        if self.is_fitted:
             return f'nnet::posit<{self.width},{self.es},{self.decode_width},{self.decode_integer}>'
         return f'nnet::posit<{self.width},{self.es}>'
+
+
+class APCodebookPrecisionDefinition(APLookupTableDefinition):
+    def definition_cpp(self):
+        raise NotImplementedError('Codebook types need a named typedef, use typedef_cpp(name)')
 
 
 class ACIntegerPrecisionDefinition(PrecisionDefinition):
@@ -190,6 +221,7 @@ class APTypeConverter(FPGAPrecisionConverter):
                 FloatPrecisionType: APFloatPrecisionDefinition,
                 StandardFloatPrecisionType: APStandardFloatPrecisionDefinition,
                 PositPrecisionType: APPositPrecisionDefinition,
+                CodebookPrecisionType: APCodebookPrecisionDefinition,
                 ExponentPrecisionType: APIntegerPrecisionDefinition,
                 XnorPrecisionType: APIntegerPrecisionDefinition,
             },
@@ -229,6 +261,8 @@ class TypePrecisionConverter:
 
 class NamedTypeConverter(TypeDefinition, TypePrecisionConverter):
     def definition_cpp(self):
+        if hasattr(self.precision, 'typedef_cpp'):
+            return self.precision.typedef_cpp(self.name)
         return f'typedef {self.precision.definition_cpp()} {self.name};\n'
 
 

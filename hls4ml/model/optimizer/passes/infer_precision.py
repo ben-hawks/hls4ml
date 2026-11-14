@@ -6,6 +6,7 @@ import numpy as np
 from hls4ml.model.optimizer import ConfigurableOptimizerPass
 from hls4ml.model.optimizer.passes.bit_exact import minimal_kif
 from hls4ml.model.types import (
+    CodebookPrecisionType,
     FixedPrecisionType,
     IntegerPrecisionType,
     PositPrecisionType,
@@ -162,8 +163,8 @@ class InferPrecisionTypes(ConfigurableOptimizerPass):
             inferred_types.append('bias_t')
 
         weight_precision = node.types['weight_t'].precision
-        if isinstance(weight_precision, PositPrecisionType):
-            # Posit weights are decoded to an exact fixed-point type before the product
+        if isinstance(weight_precision, (PositPrecisionType, CodebookPrecisionType)):
+            # Posit and codebook weights are decoded to a fixed-point type before the product
             weight_precision = weight_precision.decode_precision()
 
         if self._all_supported_types((input_precision, weight_precision, node.types['bias_t'].precision)):

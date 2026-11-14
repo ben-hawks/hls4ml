@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from hls4ml.backends.fpga.fpga_backend import FPGABackend
-from hls4ml.model.types import FixedPrecisionType, PositPrecisionType
+from hls4ml.model.types import CodebookPrecisionType, FixedPrecisionType, PositPrecisionType
 
 test_root_path = Path(__file__).parent
 
@@ -63,19 +63,28 @@ def test_posit_encode_decode(width, es):
 
 @pytest.mark.parametrize('width, es', [(6, 1), (8, 0), (8, 1), (8, 2)])
 @pytest.mark.parametrize('scale', [0.05, 0.5, 4.0])
-def test_posit_narrowed(width, es, scale):
+def test_posit_fitted(width, es, scale):
     ptype = PositPrecisionType(width, es)
     data = np.random.default_rng(2).normal(scale=scale, size=(16, 12))
-    narrow = ptype.narrowed(data)
-    assert narrow.is_narrowed and not ptype.is_narrowed
-    assert PositPrecisionType.deserialize(narrow.serialize_state()) == narrow
-    assert np.array_equal(narrow.encode(data), ptype.encode(data))
+    fit = ptype.fitted(data)
+    assert fit.is_fitted and not ptype.is_fitted
+    assert fit.uses_table
+    assert PositPrecisionType.deserialize(fit.serialize_state()) == fit
+    assert np.array_equal(fit.encode(data), ptype.encode(data))
+
+    # The table holds the decoded value of every code the data uses, and nothing else
+    codes = ptype.encode(data)
+    table = fit.lookup_table()
+    assert set(fit.used_codes) == set(np.unique(codes))
+    np.testing.assert_array_equal(table[codes], ptype.quantize(data))
+    unused = np.setdiff1d(np.arange(1 << width), fit.used_codes)
+    assert np.all(table[unused] == 0)
 
     def exact(w, i):
         q = ptype.quantize(data)
         return np.all(np.mod(q * 2.0 ** (w - i), 1) == 0) and np.all(np.abs(q) < 2.0 ** (i - 1))
 
-    dp = narrow.decode_precision()
+    dp = fit.decode_precision()
     full = ptype.decode_precision()
     assert dp.width <= full.width and dp.integer <= full.integer
     assert exact(dp.width, dp.integer)
@@ -84,39 +93,85 @@ def test_posit_narrowed(width, es, scale):
     assert not exact(dp.width - 1, dp.integer)
 
 
-def _posit_model(ptype, seed=0):
+def test_posit_wide_has_no_table():
+    fit = PositPrecisionType(12, 1).fitted(np.random.default_rng(3).normal(size=100))
+    assert fit.is_fitted and not fit.uses_table
+
+
+@pytest.mark.parametrize('precision', ['codebook<4,12>', 'codebook< 8 , 16 >'])
+def test_codebook_parsing(precision):
+    ctype = FPGABackend.convert_precision_string(precision)
+    assert isinstance(ctype, CodebookPrecisionType)
+    assert FPGABackend.convert_precision_string(str(ctype)) == ctype
+    assert CodebookPrecisionType.deserialize(ctype.serialize_state()) == ctype
+
+
+@pytest.mark.parametrize('precision', ['codebook<4>', 'codebook<4,12,1>', 'codebook<a,b>'])
+def test_codebook_parsing_invalid(precision):
+    with pytest.raises(ValueError):
+        FPGABackend.convert_precision_string(precision)
+
+
+@pytest.mark.parametrize('width, decode_width', [(2, 8), (4, 12), (6, 12), (8, 16)])
+@pytest.mark.parametrize('scale', [0.05, 0.5, 4.0])
+def test_codebook_fitted(width, decode_width, scale):
+    data = np.random.default_rng(4).normal(scale=scale, size=(32, 16))
+    ctype = CodebookPrecisionType(width, decode_width)
+    with pytest.raises(RuntimeError):
+        ctype.encode(data)
+
+    fit = ctype.fitted(data)
+    assert fit.is_fitted and fit.uses_table
+    assert CodebookPrecisionType.deserialize(fit.serialize_state()) == fit
+    values = np.array(fit.values)
+    assert 1 < len(values) <= 1 << width
+    assert np.all(np.diff(values) > 0)
+
+    # Entries are representable in the decode type, which has no integer bits to spare
+    dp = fit.decode_precision()
+    assert dp.width == decode_width
+    assert np.all(np.mod(values * 2.0**dp.fractional, 1) == 0)
+    assert 2.0 ** (dp.integer - 2) <= np.max(np.abs(values)) < 2.0 ** (dp.integer - 1)
+
+    # Every value maps to its nearest entry
+    codes = fit.encode(data)
+    assert codes.min() >= 0 and codes.max() < len(values)
+    dist = np.abs(data[..., None] - values).min(axis=-1)
+    np.testing.assert_allclose(np.abs(data - fit.quantize(data)), dist, rtol=0, atol=1e-12)
+    np.testing.assert_array_equal(fit.lookup_table()[codes], fit.quantize(data))
+
+    # Refitting to already quantized data reproduces the same table
+    assert ctype.fitted(fit.quantize(data)) == fit
+
+
+def _model(seed=0):
     import keras
 
     keras.utils.set_random_seed(seed)
-    model = keras.Sequential(
+    return keras.Sequential(
         [
             keras.layers.Input((16,)),
             keras.layers.Dense(12, activation='relu', name='dense1'),
             keras.layers.Dense(5, name='dense2'),
         ]
     )
-    # Replace the weights by their posit-rounded values so the posit and fixed point models see the same numbers
+
+
+def _quantize_weights(model, ptype):
+    """Replace the kernels by the values ``ptype`` stores, so the table and fixed point models see the same numbers."""
     for layer in model.layers:
         kernel, bias = layer.get_weights()
-        layer.set_weights([ptype.quantize(kernel).astype(np.float32), bias])
+        layer.set_weights([ptype.fitted(kernel).quantize(kernel).astype(np.float32), bias])
     return model
 
 
-@pytest.mark.parametrize('width, es', [(8, 0), (6, 1)])
-@pytest.mark.parametrize(
-    'io_type, strategy',
-    [('io_parallel', 'Latency'), ('io_parallel', 'Resource'), ('io_stream', 'Latency'), ('io_stream', 'Resource')],
-)
-def test_posit_weights_dense(test_case_id, width, es, io_type, strategy):
+def _check_table_weights(test_case_id, model, ptype, io_type, strategy):
     import hls4ml
 
-    ptype = PositPrecisionType(width, es)
-    model = _posit_model(ptype)
     X = np.random.default_rng(1).uniform(-2, 2, size=(200, 16)).astype(np.float32)
-
     predictions = {}
     weight_precisions = {'dense1': str(ptype), 'dense2': str(ptype)}
-    for suffix in ('posit', 'fixed'):
+    for suffix in ('table', 'fixed'):
         config = hls4ml.utils.config_from_keras_model(
             model, granularity='name', default_precision='fixed<16,6>', backend='Vitis'
         )
@@ -132,19 +187,45 @@ def test_posit_weights_dense(test_case_id, width, es, io_type, strategy):
         hls_model.compile()
         predictions[suffix] = hls_model.predict(X)
 
-        if suffix == 'posit':
+        if suffix == 'table':
             defines = Path(output_dir, 'firmware', 'defines.h').read_text()
             for name in ('dense1', 'dense2'):
-                # The decode type is narrowed to each layer's weights; the fixed point reference uses the same type
+                # The fixed point reference stores the same values directly, in the decode type
                 wp = hls_model.graph[name].get_attr('weight_t').precision
+                assert wp.is_fitted
                 dp = wp.decode_precision()
-                assert wp.is_narrowed and dp.width <= ptype.decode_precision().width
-                assert f'nnet::posit<{width},{es},{dp.width},{dp.integer}>' in defines
+                if wp.uses_table:
+                    lut = f'nnet::lut_weight<{ptype.width}, ap_fixed<{dp.width},{dp.integer}>, {name}_weight_t_table>'
+                    assert lut in defines
+                else:
+                    assert f'nnet::posit<{ptype.width},{ptype.es},{dp.width},{dp.integer}>' in defines
                 weight_precisions[name] = f'fixed<{dp.width},{dp.integer}>'
             weights = Path(output_dir, 'firmware', 'weights', 'w2.h').read_text()
             codes = weights.split('= {')[1].split('}')[0].split(',')
-            assert all(0 <= int(c) < (1 << width) for c in codes)
+            assert all(0 <= int(c) < (1 << ptype.width) for c in codes)
 
-    # Decoding posits to their exact fixed point value must give bit-identical results
-    np.testing.assert_array_equal(predictions['posit'], predictions['fixed'])
-    np.testing.assert_allclose(predictions['posit'], model.predict(X, verbose=0), rtol=0, atol=5e-2)
+    # Decoding the stored codes must give results bit-identical to storing the decoded values
+    np.testing.assert_array_equal(predictions['table'], predictions['fixed'])
+    np.testing.assert_allclose(predictions['table'], model.predict(X, verbose=0), rtol=0, atol=5e-2)
+
+
+IO_STRATEGIES = [
+    ('io_parallel', 'Latency'),
+    ('io_parallel', 'Resource'),
+    ('io_stream', 'Latency'),
+    ('io_stream', 'Resource'),
+]
+
+
+@pytest.mark.parametrize('width, es', [(8, 0), (6, 1), (12, 1)])
+@pytest.mark.parametrize('io_type, strategy', IO_STRATEGIES)
+def test_posit_weights_dense(test_case_id, width, es, io_type, strategy):
+    ptype = PositPrecisionType(width, es)
+    _check_table_weights(test_case_id, _quantize_weights(_model(), ptype), ptype, io_type, strategy)
+
+
+@pytest.mark.parametrize('width, decode_width', [(4, 12), (8, 16)])
+@pytest.mark.parametrize('io_type, strategy', IO_STRATEGIES)
+def test_codebook_weights_dense(test_case_id, width, decode_width, io_type, strategy):
+    ctype = CodebookPrecisionType(width, decode_width)
+    _check_table_weights(test_case_id, _quantize_weights(_model(), ctype), ctype, io_type, strategy)
