@@ -70,32 +70,54 @@ def test_posit_fitted(width, es, scale):
     assert fit.is_fitted and not ptype.is_fitted
     assert fit.uses_table
     assert PositPrecisionType.deserialize(fit.serialize_state()) == fit
-    assert np.array_equal(fit.encode(data), ptype.encode(data))
+
+    # Codes are the posit codes of the data divided by the power-of-two scale
+    shifted = PositPrecisionType(width, es)
+    np.testing.assert_array_equal(fit.encode(data), shifted.encode(data * 2.0**-fit.scale))
+    np.testing.assert_array_equal(fit.quantize(data), shifted.quantize(data * 2.0**-fit.scale) * 2.0**fit.scale)
 
     # The table holds the decoded value of every code the data uses, and nothing else
-    codes = ptype.encode(data)
+    codes = fit.encode(data)
     table = fit.lookup_table()
     assert set(fit.used_codes) == set(np.unique(codes))
-    np.testing.assert_array_equal(table[codes], ptype.quantize(data))
+    np.testing.assert_array_equal(table[codes], fit.quantize(data))
     unused = np.setdiff1d(np.arange(1 << width), fit.used_codes)
     assert np.all(table[unused] == 0)
 
     def exact(w, i):
-        q = ptype.quantize(data)
+        q = fit.quantize(data)
         return np.all(np.mod(q * 2.0 ** (w - i), 1) == 0) and np.all(np.abs(q) < 2.0 ** (i - 1))
 
     dp = fit.decode_precision()
-    full = ptype.decode_precision()
-    assert dp.width <= full.width and dp.integer <= full.integer
     assert exact(dp.width, dp.integer)
     # One bit fewer integer or fractional bits is no longer exact
     assert not exact(dp.width - 1, dp.integer - 1)
     assert not exact(dp.width - 1, dp.integer)
 
 
+@pytest.mark.parametrize('width, es', [(6, 1), (8, 0), (8, 1), (8, 2)])
+@pytest.mark.parametrize('scale', [1e-3, 0.05, 0.5, 4.0, 300.0])
+def test_posit_scale(width, es, scale):
+    data = np.random.default_rng(5).normal(scale=scale, size=(32, 16))
+    ptype = PositPrecisionType(width, es)
+    fit = ptype.fitted(data)
+
+    def err(s):
+        return np.sum((PositPrecisionType(width, es, scale=s).quantize(data) - data) ** 2)
+
+    # The chosen scale is the best power of two nearby, and never worse than no scale
+    assert err(fit.scale) <= err(0)
+    assert all(err(fit.scale) <= err(s) for s in range(fit.scale - 3, fit.scale + 4))
+
+    # Refitting to the stored values reproduces them exactly
+    q = fit.quantize(data)
+    np.testing.assert_array_equal(ptype.fitted(q).quantize(q), q)
+
+
 def test_posit_wide_has_no_table():
-    fit = PositPrecisionType(12, 1).fitted(np.random.default_rng(3).normal(size=100))
+    fit = PositPrecisionType(12, 1).fitted(np.random.default_rng(3).normal(scale=0.01, size=100))
     assert fit.is_fitted and not fit.uses_table
+    assert fit.scale == 0  # The arithmetic decoder has no table to fold a scale into
 
 
 @pytest.mark.parametrize('precision', ['codebook<4,12>', 'codebook< 8 , 16 >'])
