@@ -86,7 +86,7 @@ class APLookupTableDefinition(PrecisionDefinition):
             f'    static {decode} lookup(unsigned code) {{\n'
             f'        #pragma HLS INLINE\n'
             f'        static const {decode} values[{1 << self.width}] = {{{values}}};\n'
-            f'        #pragma HLS BIND_STORAGE variable=values type=rom_np impl=lutram\n'
+            f'        #pragma HLS ARRAY_PARTITION variable=values complete\n'
             f'        return values[code];\n'
             f'    }}\n'
             f'}};\n'
